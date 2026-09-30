@@ -1612,7 +1612,10 @@ class CalendarService:
                 travel_routing = travel_routing or existing.get("routing")
                 if travel_origin_geo is None and keep.get("latitude") is not None:
                     travel_origin_geo = f"{keep['latitude']},{keep['longitude']}"
-            _apply_structured_location(ev, location, location_geo)
+            if location is not None or location_geo is not None:
+                # Only when the caller changes the place: Apple's own structured location (MapKit handle, coordinates)
+                # never carries an X-ADDRESS equal to LOCATION, so rebuilding it on every edit wiped the map card.
+                _apply_structured_location(ev, location, location_geo)
             _apply_travel(ev, travel_minutes, travel_routing, travel_origin, travel_origin_geo)
 
             seq = int(ev.get("sequence", 0) or 0) + 1
