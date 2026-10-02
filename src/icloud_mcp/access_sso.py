@@ -9,19 +9,49 @@ What is trusted is the signed `Cf-Access-Jwt-Assertion` header, never a plain em
 is checked against the team's published keys, its audience must be this Access application, its issuer the team domain,
 it must be unexpired, and its email must be one of the configured owner identities. A request that reaches the origin
 without passing Access carries no valid token and falls back to the password form. The password keeps working.
+
+The team keys come from `https://<team>/cdn-cgi/access/certs`. A host whose container may not reach the internet sets
+OWNER_ACCESS_CERTS_FILE instead: something outside the container refreshes that file, and it is re-read when it changes.
 """
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 from typing import Any
 
 import jwt
-from jwt import PyJWKClient
+from jwt import PyJWKClient, PyJWKSet
 
 log = logging.getLogger(__name__)
 
 HEADER = "cf-access-jwt-assertion"
+FETCH_TIMEOUT = 5  # seconds; a key fetch that hangs must not hold the page, the password form is the fallback
+
+
+class FileJWKS:
+    """The team key set from a local JSON file (the body of /cdn-cgi/access/certs), re-read when the file changes."""
+
+    def __init__(self, path: str) -> None:
+        self.path = path
+        self._mtime = -1.0
+        self._keys: dict[str, Any] = {}
+
+    def _load(self) -> None:
+        mtime = os.stat(self.path).st_mtime
+        if mtime != self._mtime:
+            with open(self.path, encoding="utf-8") as f:
+                keyset = PyJWKSet.from_dict(json.load(f))
+            self._keys = {k.key_id: k for k in keyset.keys}
+            self._mtime = mtime
+
+    def get_signing_key_from_jwt(self, token: str) -> Any:
+        self._load()
+        kid = jwt.get_unverified_header(token).get("kid")
+        if kid not in self._keys:
+            raise jwt.PyJWKClientError(f"no key with this kid in {self.path}")
+        return self._keys[kid]
 
 
 class AccessOwnerVerifier:
@@ -30,7 +60,8 @@ class AccessOwnerVerifier:
         self.aud = aud
         self.emails = frozenset(e.lower() for e in emails)
         # PyJWKClient caches the key set and refetches on an unknown key id (key rotation).
-        self._jwks = jwks_client or PyJWKClient(f"{self.issuer}/cdn-cgi/access/certs", cache_keys=True, lifespan=3600)
+        self._jwks = jwks_client or PyJWKClient(f"{self.issuer}/cdn-cgi/access/certs", cache_keys=True, lifespan=3600,
+                                                timeout=FETCH_TIMEOUT)
 
     def _verify(self, token: str) -> str | None:
         try:
@@ -56,5 +87,6 @@ class AccessOwnerVerifier:
 
 def from_settings(settings: Any) -> AccessOwnerVerifier | None:
     if settings.owner_access_team and settings.owner_access_aud and settings.owner_access_emails:
-        return AccessOwnerVerifier(settings.owner_access_team, settings.owner_access_aud, settings.owner_access_emails)
+        jwks = FileJWKS(settings.owner_access_certs_file) if settings.owner_access_certs_file else None
+        return AccessOwnerVerifier(settings.owner_access_team, settings.owner_access_aud, settings.owner_access_emails, jwks)
     return None

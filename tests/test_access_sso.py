@@ -97,3 +97,28 @@ def test_option_needs_all_three_settings(env, monkeypatch):  # noqa: F811
     assert access_sso.from_settings(Settings.from_env()) is None
     monkeypatch.setenv("OWNER_ACCESS_EMAILS", OWNER)
     assert access_sso.from_settings(Settings.from_env()) is not None
+
+
+async def test_keys_from_a_local_file(env, monkeypatch, tmp_path):  # noqa: F811
+    """Egress-locked hosts: the team keys come from OWNER_ACCESS_CERTS_FILE, never from the network."""
+    from jwt.algorithms import RSAAlgorithm
+    import json as _json
+    jwk = _json.loads(RSAAlgorithm.to_jwk(KEY.public_key()))
+    jwk.update(kid="k1", alg="RS256", use="sig")
+    certs = tmp_path / "access-certs.json"
+    certs.write_text(_json.dumps({"keys": [jwk], "public_cert": {"kid": "k1", "cert": "-"}}))
+
+    def no_network(*_a, **_kw):
+        raise AssertionError("must not fetch keys over the network")
+
+    monkeypatch.setattr(access_sso, "PyJWKClient", no_network)
+    for k, v in dict(OWNER_ACCESS_TEAM_DOMAIN=TEAM, OWNER_ACCESS_AUD=AUD, OWNER_ACCESS_EMAILS=OWNER,
+                     OWNER_ACCESS_CERTS_FILE=str(certs)).items():
+        monkeypatch.setenv(k, v)
+    v = access_sso.from_settings(Settings.from_env())
+    assert await v.owner_email({"cf-access-jwt-assertion": token()}) == OWNER
+    assert await v.owner_email({"cf-access-jwt-assertion": token(key=OTHER_KEY)}) is None
+    # unknown kid (rotated keys not yet in the file) -> not signed in, no exception
+    other = jwt.encode({"aud": [AUD], "iss": f"https://{TEAM}", "email": OWNER, "iat": int(time.time()), "exp": int(time.time()) + 60},
+                       KEY, algorithm="RS256", headers={"kid": "k2"})
+    assert await v.owner_email({"cf-access-jwt-assertion": other}) is None
