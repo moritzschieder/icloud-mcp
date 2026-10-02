@@ -2,7 +2,8 @@
 
 An MCP client (possibly steered by injected text in an email) can only *queue* a message. It is delivered only after the
 owner opens /outbox in a browser, types the owner password, reviews the exact message and presses Approve. No page here
-is reachable by, or returns anything useful to, a caller who lacks the password.
+is reachable by, or returns anything useful to, a caller who lacks the password. Optionally (access_sso.py) a verified
+Cloudflare Access identity of the owner replaces the password on GET /outbox.
 """
 from __future__ import annotations
 
@@ -18,6 +19,7 @@ from typing import Any
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, Response
 
+from . import access_sso
 from .auth import OwnerOAuthProvider
 from .config import Settings
 from .mail import MailService
@@ -73,6 +75,7 @@ def _row(label: str, value: str) -> str:
 def register_outbox_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Settings, mail: MailService | None,
                            imessage: Any = None, imessage_outbox: Any = None) -> None:
     key = secrets.token_bytes(32)  # per-process: buttons issued before a restart simply stop working
+    access = access_sso.from_settings(settings)
     outboxes = {k: o for k, o in (("mail", mail.outbox if mail is not None else None), ("imessage", imessage_outbox)) if o is not None}
 
     def _tok(kind: str, item_id: str, sha: str, action: str, exp: int) -> str:
@@ -162,7 +165,10 @@ def register_outbox_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Set
         return _page("Outgoing message approval", "".join(parts))
 
     @mcp.custom_route("/outbox", methods=["GET"])
-    async def outbox_get(_: Request) -> Response:
+    async def outbox_get(request: Request) -> Response:
+        if access is not None and (who := await access.owner_email(request.headers)):
+            log.info("Owner signed in to /outbox through Cloudflare Access")
+            return _queue_page(f'<p class="muted">Signed in as {html.escape(who)}.</p>')
         return _login_form()
 
     @mcp.custom_route("/outbox", methods=["POST"])

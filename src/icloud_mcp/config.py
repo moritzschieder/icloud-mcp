@@ -173,6 +173,9 @@ class Settings:
     owner_addresses: tuple[str, ...] = ()   # OWNER_ADDRESSES: more addresses that are the owner's (aliases), e.g. on invitations
     shortcuts_allow: tuple[str, ...] = ()   # SHORTCUTS_ALLOW: exact Shortcut names the assistant may run (the Mac keeps its own list too)
     admin_port: int = 0           # ADMIN_PORT: loopback-only admin API for the menu bar app (0 = off); never the tunnelled port
+    owner_access_team: str = ""   # OWNER_ACCESS_TEAM_DOMAIN: Cloudflare Access team domain (e.g. myteam.cloudflareaccess.com)
+    owner_access_aud: str = ""    # OWNER_ACCESS_AUD: AUD tag of the Access application in front of /outbox
+    owner_access_emails: tuple[str, ...] = ()  # OWNER_ACCESS_EMAILS: Access identities that count as the owner (all three set = on)
     overrides_active: tuple[str, ...] = ()  # which OVERRIDABLE settings come from DATA_DIR/overrides.json (names only)
 
     @classmethod
@@ -260,6 +263,9 @@ class Settings:
             max_attendees=max(1, _int("MAX_ATTENDEES", 10)),
             contacts_allow_email_changes=_bool("CONTACTS_ALLOW_EMAIL_CHANGES", True),
             mail_max_age_days=max(0, _int("MAIL_MAX_AGE_DAYS", 0)),
+            owner_access_team=_str("OWNER_ACCESS_TEAM_DOMAIN").removeprefix("https://").rstrip("/").lower(),
+            owner_access_aud=_str("OWNER_ACCESS_AUD"),
+            owner_access_emails=tuple(x.strip().lower() for x in _list("OWNER_ACCESS_EMAILS") if x.strip()),
             safety_screen=_str("SAFETY_SCREEN"),
             owner_addresses=tuple(a.strip().lower() for a in _list("OWNER_ADDRESSES") if a.strip()),
             shortcuts_allow=tuple(n.strip() for n in _str("SHORTCUTS_ALLOW").split(";" if ";" in _str("SHORTCUTS_ALLOW") else ",") if n.strip()),
