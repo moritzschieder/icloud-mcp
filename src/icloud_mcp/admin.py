@@ -79,6 +79,27 @@ def save_override(data_dir: str, key: str, value: str) -> None:
     _write_private(path, json.dumps(data, indent=2) + "\n")
 
 
+async def check_and_store_app_password(s: Settings, raw: str, via: str) -> str | None:
+    """Normalise an app-specific password, prove it against iCloud Mail and store it as an override.
+
+    Returns an error text for the person, or None when it was saved (it applies after a restart). Shared by the admin
+    API and the /setup page; the password is never logged."""
+    value = raw.replace(" ", "").replace("-", "")
+    value = "-".join(value[i:i + 4] for i in range(0, len(value), 4)) if len(value) == 16 else value
+    if len(value.replace("-", "")) != 16:
+        return "An app-specific password has 16 letters, like abcd-efgh-ijkl-mnop."
+    from .mail import MailService
+    try:                                             # prove it works before anything is saved
+        c = await asyncio.to_thread(MailService(dataclasses.replace(s, app_password=value))._login)
+        await asyncio.to_thread(c.logout)
+    except Exception:  # noqa: BLE001 - the reason can quote the account; say only that it failed
+        log.warning("A new app-specific password from %s was refused by iCloud; nothing saved", via)
+        return "iCloud did not accept this password. Nothing was changed."
+    save_override(s.data_dir, "icloud_app_password", value)
+    log.warning("iCloud app-specific password changed through %s; it applies after a restart", via)
+    return None
+
+
 def _area_of(tool: str) -> str:
     head = tool.split("_", 1)[0]
     return head if head in _AREAS else "other"
@@ -191,19 +212,8 @@ def build_admin_app(s: Settings, mcp: Any, provider: Any, token: str, *, exit_fn
     async def app_password(request: Request) -> JSONResponse:
         if r := refuse(request):
             return r
-        value = str((await body(request)).get("password", "")).replace(" ", "").replace("-", "")
-        value = "-".join(value[i:i + 4] for i in range(0, len(value), 4)) if len(value) == 16 else value
-        if len(value.replace("-", "")) != 16:
-            return JSONResponse({"error": "An app-specific password has 16 letters, like abcd-efgh-ijkl-mnop."}, status_code=400)
-        from .mail import MailService
-        try:                                             # prove it works before anything is saved
-            c = await asyncio.to_thread(MailService(dataclasses.replace(s, app_password=value))._login)
-            await asyncio.to_thread(c.logout)
-        except Exception:  # noqa: BLE001 - the reason can quote the account; say only that it failed
-            log.warning("Admin API: a new app-specific password was refused by iCloud; nothing saved")
-            return JSONResponse({"error": "iCloud did not accept this password. Nothing was changed."}, status_code=400)
-        save_override(s.data_dir, "icloud_app_password", value)
-        log.warning("iCloud app-specific password changed through the admin API; it applies after a restart")
+        if problem := await check_and_store_app_password(s, str((await body(request)).get("password", "")), "the admin API"):
+            return JSONResponse({"error": problem}, status_code=400)
         return JSONResponse({"saved": True, "restart_required": True})
 
     async def restart(request: Request) -> JSONResponse:

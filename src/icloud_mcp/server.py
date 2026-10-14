@@ -27,6 +27,7 @@ from starlette.responses import HTMLResponse, PlainTextResponse, Response
 from . import callctx
 from .approvals import register_outbox_routes
 from .auth import SCOPE, OwnerOAuthProvider, register_routes
+from .setup_page import register_setup_routes
 from .bridge import BridgeError, MacBridge, build_bridge_app, ensure_tls, start_bridge_listener
 from .cal import CalendarError, CalendarService, get_tz, too_frequent
 from .imessage import IMessageError, IMessageService
@@ -339,6 +340,7 @@ def create_server(s: Settings) -> tuple[MCPServer, OwnerOAuthProvider | None]:
     mcp = MCPServer("iCloud", instructions=build_instructions(s), auth_server_provider=provider, auth=auth,
                     website_url=s.public_url, icons=icons or None)
     register_routes(mcp, provider, s)
+    register_setup_routes(mcp, s)
 
     def _icon_route(path: str, filename: str, ctype: str) -> None:
         @mcp.custom_route(path, methods=["GET"])

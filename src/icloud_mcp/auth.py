@@ -35,6 +35,7 @@ from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse, Response
 
+from . import access_sso
 from .config import Settings
 
 log = logging.getLogger(__name__)
@@ -398,8 +399,7 @@ connection yourself a moment ago; anyone can ask for this page, and the password
 {error}
 <form method="post" action="/login">
 <input type="hidden" name="p" value="{pid}">
-<label for="pw">Owner password</label>
-<input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>
+{fields}
 <button class="ok" name="action" value="approve" type="submit">Approve</button>
 <button class="no" name="action" value="deny" type="submit" formnovalidate>Deny</button>
 </form></main></body></html>"""
@@ -412,7 +412,11 @@ _HEADERS = {
 }
 
 
-def _page(provider: OwnerOAuthProvider, pid: str, error: str = "", status: int = 200) -> Response:
+_PASSWORD_FIELDS = """<label for="pw">Owner password</label>
+<input id="pw" type="password" name="password" autocomplete="current-password" autofocus required>"""
+
+
+def _page(provider: OwnerOAuthProvider, pid: str, error: str = "", status: int = 200, sso: tuple[str, str] | None = None) -> Response:
     pend = provider.pending.get(pid)
     if not pend or pend["expires_at"] < time.time():
         return HTMLResponse("<p>This authorization request has expired. Return to the app and try connecting again.</p>",
@@ -421,14 +425,28 @@ def _page(provider: OwnerOAuthProvider, pid: str, error: str = "", status: int =
     redirect = urlsplit(str(pend["params"].redirect_uri)).hostname or "?"
     body = _PAGE.format(client=html.escape(name), pid=html.escape(pid), redirect=html.escape(redirect),
                         cid=html.escape(OwnerOAuthProvider._cid(pend.get("client_id"))),
-                        error=f'<p class="err">{html.escape(error)}</p>' if error else "")
+                        error=f'<p class="err">{html.escape(error)}</p>' if error else "",
+                        fields=(f'<p class="muted">Signed in as <b>{html.escape(sso[0])}</b> through Cloudflare Access.</p>'
+                                f'<input type="hidden" name="sso" value="{html.escape(sso[1])}">') if sso else _PASSWORD_FIELDS)
     return HTMLResponse(body, status_code=status, headers=_HEADERS)
 
 
 def register_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Settings) -> None:
+    # Optional: the owner identity that Cloudflare Access vouches for replaces the owner password on the consent page
+    # (access_sso.py). The approve button then carries a token bound to this pending request and this identity, issued
+    # only on the GET that Access let through, so a cross-site POST cannot approve on the owner's behalf.
+    access = access_sso.from_settings(settings)
+    sso_key = secrets.token_bytes(32)  # per-process: a page issued before a restart asks again
+
+    def _sso_tok(pid: str, who: str) -> str:
+        return hmac.new(sso_key, f"login|{pid}|{who}".encode(), hashlib.sha256).hexdigest()
+
     @mcp.custom_route("/login", methods=["GET"])
     async def login_get(request: Request) -> Response:
-        return _page(provider, request.query_params.get("p", ""))
+        pid = request.query_params.get("p", "")
+        if access is not None and (who := await access.owner_email(request.headers)):
+            return _page(provider, pid, sso=(who, _sso_tok(pid, who)))
+        return _page(provider, pid)
 
     @mcp.custom_route("/login", methods=["POST"])
     async def login_post(request: Request) -> Response:
@@ -437,6 +455,14 @@ def register_routes(mcp: Any, provider: OwnerOAuthProvider, settings: Settings) 
         action = str(form.get("action", "approve"))
         if action == "deny":
             url = provider.deny(pid)
+            return RedirectResponse(url, status_code=302, headers=_HEADERS) if url else _page(provider, pid)
+        if access is not None and form.get("sso"):
+            who = await access.owner_email(request.headers)
+            if not who or not hmac.compare_digest(str(form.get("sso")).encode(), _sso_tok(pid, who).encode()):
+                log.warning("Rejected a Cloudflare Access approval on /login")
+                return _page(provider, pid, "Your sign-in could not be confirmed. Reload this page and try again.", 403)
+            url = provider.approve(pid)
+            log.info("Owner approved a client through Cloudflare Access")
             return RedirectResponse(url, status_code=302, headers=_HEADERS) if url else _page(provider, pid)
         if not provider.login_allowed():
             return _page(provider, pid, "Too many failed attempts. Try again in 15 minutes.", 429)

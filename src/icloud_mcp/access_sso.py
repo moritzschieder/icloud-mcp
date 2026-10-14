@@ -1,4 +1,4 @@
-"""Optional owner sign-in through Cloudflare Access for the /outbox page.
+"""Optional owner sign-in through Cloudflare Access for /outbox, the /login consent page and /setup.
 
 When the server sits behind a Cloudflare Access application that already authenticates the owner (for example with an
 OIDC identity provider and a passkey), asking for the owner password again on /outbox is a second login for the same
@@ -69,7 +69,7 @@ class AccessOwnerVerifier:
             claims = jwt.decode(token, key, algorithms=["RS256"], audience=self.aud, issuer=self.issuer,
                                 options={"require": ["exp", "iat", "aud", "iss"]})
         except Exception as e:  # noqa: BLE001  -- any failure means "not signed in", the password form stays
-            log.warning("Rejected Cloudflare Access token on /outbox: %s", type(e).__name__)
+            log.warning("Rejected Cloudflare Access token: %s", type(e).__name__)
             return None
         email = str(claims.get("email", "")).lower()
         if email not in self.emails:
