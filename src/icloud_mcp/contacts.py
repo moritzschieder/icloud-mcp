@@ -51,6 +51,9 @@ _SKIP = {"PHOTO", "LOGO", "SOUND", "KEY", "NOTE", "X-IMAGEHASH", "X-IMAGETYPE", 
 _LINE = re.compile(r'^(?P<key>[^:;]+)(?P<params>(?:;(?:"[^"]*"|[^:;"])*)*):(?P<value>.*)$')
 _ESC = re.compile(r"\\([\\,;nN])")
 _TYPE_LABELS = ("home", "work", "school", "other", "mobile", "cell", "iphone", "main", "fax", "pager", "car", "assistant", "callback")
+# vCard ADR component order (RFC 2426 3.2.1); the names are what the tools accept and return (same as upstream v0.12)
+ADR_PARTS = ("po_box", "extended", "street", "city", "region", "postal_code", "country")
+_ADR_TYPES = {"home", "work", "other"}
 
 
 def _unescape(v: str) -> str:
@@ -149,9 +152,11 @@ def parse_vcard(text: str) -> dict[str, Any] | None:
         elif name == "BDAY":
             c["birthday"] = value.strip()
         elif name == "ADR":
-            addr = ", ".join(p for p in (_unescape(x).strip() for x in _split(value, ";")) if p)
+            parts = [_unescape(x).strip() for x in _split(value, ";")] + [""] * 7
+            addr = ", ".join(p for p in parts[:7] if p)
             if addr:
-                c["addresses"].append({"address": addr, "label": _label(_types(params), custom)})
+                c["addresses"].append({"address": addr, "label": _label(_types(params), custom),
+                                       **{k: parts[i] for i, k in enumerate(ADR_PARTS)}})
         elif name == "URL":
             u = _unescape(value).strip()
             if u:
@@ -213,8 +218,14 @@ def _brief(c: dict[str, Any]) -> dict[str, Any]:
     return {k: c[k] for k in ("uid", "name", "nickname", "organization", "job_title", "emails", "phones", "has_email")}
 
 
+# Every character str.splitlines() treats as a line break. Left raw in a value, one would end the property early and let the
+# rest of the value be read as a property of its own (parse_vcard and the unfold step both split this way).
+_LINE_BREAKS = re.compile(r"\r\n|[\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]")
+
+
 def _v_escape(value: str) -> str:
-    return value.replace("\\", "\\\\").replace("\n", "\\n").replace(";", "\\;").replace(",", "\\,")
+    value = value.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+    return _LINE_BREAKS.sub("\\\\n", value)
 
 
 def _v_line(name: str, value: str) -> str:
@@ -226,9 +237,64 @@ def _v_structured(name: str, parts: list[str]) -> str:
     return f"{name}:{';'.join(_v_escape(part) for part in parts)}"
 
 
+def _adr_parts(a: dict[str, Any]) -> list[str]:
+    return [str(a.get(k) or "").strip() for k in ADR_PARTS]
+
+
+def _adr_lines(addresses: list[dict[str, Any]] | None, first_item: int = 1) -> list[str]:
+    """ADR properties for iCloud. home/work/other become TYPE parameters; any other label is stored the way Apple does,
+    as a grouped itemN.ADR with an itemN.X-ABLabel, so Contacts on the Mac and iPhone show it."""
+    out: list[str] = []
+    n = first_item
+    for a in addresses or []:
+        parts = _adr_parts(a)
+        if not any(parts):
+            continue
+        label = str(a.get("label") or "").strip()
+        if not label or label.lower() in _ADR_TYPES:
+            out.append(_v_structured(f"ADR;TYPE={(label or 'home').upper()}", parts))
+        else:
+            out.append(_v_structured(f"item{n}.ADR", parts))
+            out.append(_v_line(f"item{n}.X-ABLabel", label))
+            n += 1
+    return out
+
+
+def _free_item_number(raw: str) -> int:
+    used = [int(m) for m in re.findall(r"(?im)^item(\d+)\.", raw)]
+    return max(used, default=0) + 1
+
+
+def _address_blocks(lines: list[str]) -> list[tuple[dict[str, Any], list[str], str]]:
+    """Each stored ADR as (parsed address, its original lines, its Apple group or ""). A grouped ADR brings along every
+    line of its group (item2.X-ABADR country code, item2.X-ABLabel), so it can be written back exactly as it was."""
+    groups: dict[str, list[str]] = {}
+    for line in lines:
+        m = _LINE.match(line)
+        if m and "." in m["key"]:
+            groups.setdefault(m["key"].rpartition(".")[0].lower(), []).append(line)
+    blocks = []
+    for line in lines:
+        m = _LINE.match(line)
+        if not m or m["key"].rpartition(".")[2].upper() != "ADR":
+            continue
+        group = m["key"].rpartition(".")[0].lower()
+        own = groups[group] if group else [line]
+        parsed = parse_vcard("\r\n".join(["BEGIN:VCARD", "UID:x", *own, "END:VCARD"]))
+        if parsed and parsed["addresses"]:
+            blocks.append((parsed["addresses"][0], own, group))
+    return blocks
+
+
+def _same_address(stored: dict[str, Any], wanted: dict[str, Any]) -> bool:
+    return (_adr_parts(stored) == _adr_parts(wanted)
+            and (stored.get("label") or "home").lower() == (str(wanted.get("label") or "").strip() or "home").lower())
+
+
 def build_vcard(*, uid: str, given_name: str = "", family_name: str = "", name: str = "", nickname: str = "",
                 organization: str = "", job_title: str = "", emails: list[str] | None = None,
-                phones: list[str] | None = None, birthday: str = "", urls: list[str] | None = None) -> str:
+                phones: list[str] | None = None, birthday: str = "", urls: list[str] | None = None,
+                addresses: list[dict[str, Any]] | None = None) -> str:
     """Build the safe, non-secret subset of an iCloud-compatible vCard 3.0."""
     display = name.strip() or " ".join(p for p in (given_name.strip(), family_name.strip()) if p) or organization.strip()
     if not display:
@@ -243,6 +309,7 @@ def build_vcard(*, uid: str, given_name: str = "", family_name: str = "", name: 
     for url in urls or []:
         if url.strip():
             lines.append(_v_line("URL", url.strip()))
+    lines += _adr_lines(addresses)
     for key, value in (("NICKNAME", nickname), ("ORG", organization), ("TITLE", job_title), ("BDAY", birthday)):
         if value.strip():
             lines.append(_v_line(key, value.strip()))
@@ -253,7 +320,7 @@ def _replace_vcard_fields(raw: str, **updates: Any) -> str:
     """Replace selected fields while retaining untouched iCloud vCard properties (photos, notes, labels, etc.)."""
     replace = {"name": ("FN",), "given_name": ("N",), "family_name": ("N",), "nickname": ("NICKNAME",),
                "organization": ("ORG",), "job_title": ("TITLE",), "emails": ("EMAIL",), "phones": ("TEL",),
-               "birthday": ("BDAY",), "urls": ("URL",)}
+               "birthday": ("BDAY",), "urls": ("URL",), "addresses": ("ADR",)}
     wanted = {k for k, v in updates.items() if v is not None}
     if not wanted:
         raise ContactsError("Provide at least one field to change.")
@@ -280,11 +347,29 @@ def _replace_vcard_fields(raw: str, **updates: Any) -> str:
             generated.extend(_v_line(key, item.strip()) for item in updates[field] if item.strip())
 
     lines = re.sub(r"\r?\n[ \t]", "", raw).splitlines()
+    dropped_groups: set[str] = set()
+    if "addresses" in wanted:
+        # An address passed back unchanged (as contacts_get returned it) keeps its original lines, including Apple's
+        # X-ABADR country code and pref flag; only new or edited ones are generated. A replaced grouped ADR takes its
+        # group's lines (item3.X-ABLabel, item3.X-ABADR) with it, so no orphaned labels are left behind.
+        stored = _address_blocks(lines)
+        dropped_groups = {group for _, _, group in stored if group}
+        unused = list(stored)
+        fresh: list[dict[str, Any]] = []
+        for a in updates["addresses"]:
+            match = next((b for b in unused if _same_address(b[0], a)), None)
+            if match:
+                unused.remove(match)
+                generated.extend(match[1])
+            else:
+                fresh.append(a)
+        generated.extend(_adr_lines(fresh, _free_item_number(raw)))
+
     kept: list[str] = []
     for line in lines:
         m = _LINE.match(line)
-        prop = "" if not m else m["key"].rsplit(".", 1)[-1].upper()
-        if prop in keys:
+        group, _, prop = ("", "", "") if not m else m["key"].rpartition(".")
+        if prop.upper() in keys or (group and group.lower() in dropped_groups):
             continue
         kept.append(line)
     try:
@@ -494,11 +579,12 @@ class ContactsService:
 
     def create(self, *, name: str = "", given_name: str = "", family_name: str = "", nickname: str = "",
                organization: str = "", job_title: str = "", emails: list[str] | None = None,
-               phones: list[str] | None = None, birthday: str = "", urls: list[str] | None = None) -> dict[str, Any]:
+               phones: list[str] | None = None, birthday: str = "", urls: list[str] | None = None,
+               addresses: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         uid = str(uuid.uuid4())
         raw = build_vcard(uid=uid, name=name, given_name=given_name, family_name=family_name, nickname=nickname,
                           organization=organization, job_title=job_title, emails=emails, phones=phones,
-                          birthday=birthday, urls=urls)
+                          birthday=birthday, urls=urls, addresses=addresses)
         with self._lock, self._client() as client:
             if not self._books:
                 self._books = self._discover(client)

@@ -61,7 +61,8 @@ def test_phones_org_escapes_and_structure():
     assert c["organization"] == "Acme, Inc., Sales" and c["job_title"] == "Head of Sales"
     assert c["name"] == "Anna Rivera" and c["given_name"] == "Anna Maria" and c["family_name"] == "Rivera"
     assert c["birthday"] == "1990-04-01" and c["urls"] == ["https://acme.example"]
-    assert c["addresses"] == [{"address": "1 Main St;Apt 2, Springfield, 12345, Exampleland", "label": "home"}]   # \; unescaped, empty parts dropped
+    a = c["addresses"]
+    assert [{k: x[k] for k in ("address", "label")} for x in a] == [{"address": "1 Main St;Apt 2, Springfield, 12345, Exampleland", "label": "home"}]   # \; unescaped, empty parts dropped
     assert parse_vcard(CARDS[6])["name"] == "Doe, Jane"
 
 
@@ -420,3 +421,136 @@ def test_agents_never_see_internal_fields_after_a_read(wenv):
     _, _, svc = wenv
     assert not any(k.startswith("_") for k in svc.get("11111111-2222-3333-4444-555555555555"))
     assert not any(k.startswith("_") for c in svc.search("anna")["contacts"] for k in c)
+
+
+# ------------------------------------------------------------------ postal addresses
+# Shaped like a card the iPhone writes: grouped ADRs with Apple's X-ABADR country code and pref flag, plus Apple-only
+# properties (related names, social profile, IMPP, X-ABShowAs) the connector neither reads nor writes.
+EMMA_UID = "6222c2fe-845b-42e1-ad6f-97f5ef4a5643"
+EMMA = "\r\n".join([
+    "BEGIN:VCARD", "VERSION:3.0", "PRODID:-//Apple Inc.//iOS 27.0//EN",
+    "N:Bush;Emma Jayne;;;", "FN:Emma Jayne Bush",
+    "item1.ADR;type=HOME;type=pref:;;12 High Street;Hull;East Riding of Yorkshire;HU1 1AA;United Kingdom",
+    "item1.X-ABADR:gb",
+    "item2.ADR;type=WORK:;Haus B;Bahnhofstraße 5;München;;80335;Deutschland", "item2.X-ABADR:de",
+    "item3.X-ABRELATEDNAMES:Tom Bush", "item3.X-ABLabel:_$!<Brother>!$_",
+    "X-SOCIALPROFILE;type=twitter:x-apple:emmajb", "IMPP;X-SERVICE-TYPE=Skype:skype:emmajb",
+    "X-ABShowAs:PERSON", "NOTE:private note",
+    f"UID:{EMMA_UID}", "END:VCARD", ""])
+CASTLE_ROAD = {"street": "27 Castle Road", "city": "Cottingham", "country": "UK"}
+
+
+def _addr(**kw):
+    return {"po_box": "", "extended": "", "street": "", "city": "", "region": "", "postal_code": "", "country": "", "label": "", **kw}
+
+
+def test_addresses_are_read_as_structured_fields_and_the_flat_form_stays():
+    a = parse_vcard(EMMA)["addresses"]
+    assert a[0] == {"address": "12 High Street, Hull, East Riding of Yorkshire, HU1 1AA, United Kingdom", "label": "home",
+                    "po_box": "", "extended": "", "street": "12 High Street", "city": "Hull", "region": "East Riding of Yorkshire",
+                    "postal_code": "HU1 1AA", "country": "United Kingdom"}
+    assert a[1]["extended"] == "Haus B" and a[1]["street"] == "Bahnhofstraße 5" and a[1]["label"] == "work"
+    assert parse_vcard(ANNA)["addresses"][0]["street"] == "1 Main St;Apt 2"            # escaped separator stays inside the field
+
+
+def test_adding_an_address_keeps_the_existing_ones_byte_for_byte():
+    old = parse_vcard(EMMA)["addresses"]
+    keep = [{k: v for k, v in a.items() if k != "address"} for a in old]              # passed back as contacts_get returned them
+    raw = _replace_vcard_fields(EMMA, addresses=keep + [_addr(**CASTLE_ROAD)])
+    for line in EMMA.split("\r\n")[5:9]:                                               # both stored ADRs with X-ABADR and pref
+        assert line in raw.split("\r\n")
+    assert "ADR;TYPE=HOME:;;27 Castle Road;Cottingham;;;UK" in raw.split("\r\n")       # no postal code invented
+    new = parse_vcard(raw)["addresses"]
+    assert [a["street"] for a in new] == ["12 High Street", "Bahnhofstraße 5", "27 Castle Road"]
+    assert new[2]["postal_code"] == ""
+
+
+def test_untouched_fields_and_apple_extras_survive_an_address_update():
+    raw = _replace_vcard_fields(EMMA, addresses=[_addr(**CASTLE_ROAD)])
+    for line in ("item3.X-ABRELATEDNAMES:Tom Bush", "item3.X-ABLabel:_$!<Brother>!$_", "X-SOCIALPROFILE;type=twitter:x-apple:emmajb",
+                 "IMPP;X-SERVICE-TYPE=Skype:skype:emmajb", "X-ABShowAs:PERSON", "NOTE:private note", "FN:Emma Jayne Bush",
+                 "PRODID:-//Apple Inc.//iOS 27.0//EN", f"UID:{EMMA_UID}"):
+        assert line in raw.split("\r\n")
+    assert "X-ABADR" not in raw and "item1." not in raw and "item2." not in raw         # replaced addresses leave no orphans
+
+
+def test_addresses_are_untouched_when_the_update_does_not_mention_them():
+    raw = _replace_vcard_fields(EMMA, nickname="Em")
+    assert EMMA.split("\r\n")[5:9] == [ln for ln in raw.split("\r\n") if "ADR" in ln]
+
+
+def test_an_edited_address_is_rewritten_and_the_others_kept():
+    keep = [{k: v for k, v in a.items() if k != "address"} for a in parse_vcard(EMMA)["addresses"]]
+    keep[1]["street"] = "Bahnhofstraße 7"
+    lines = _replace_vcard_fields(EMMA, addresses=keep).split("\r\n")
+    assert "item1.X-ABADR:gb" in lines and "item2.X-ABADR:de" not in lines
+    assert "ADR;TYPE=WORK:;Haus B;Bahnhofstraße 7;München;;80335;Deutschland" in lines
+
+
+def test_empty_list_clears_all_addresses():
+    raw = _replace_vcard_fields(EMMA, addresses=[])
+    assert parse_vcard(raw)["addresses"] == [] and "ADR" not in raw and "item3.X-ABLabel" in raw
+
+
+def test_special_characters_unicode_and_custom_labels_roundtrip():
+    tricky = _addr(street="Flat 2; Rose Court\nCastle Road, East", city="Köln", region="NRW", postal_code="50667",
+                   country="Vereinigtes Königreich", label="Ferienhaus, alt")
+    raw = _replace_vcard_fields(EMMA, addresses=[tricky, _addr(street="1 Work Way", label="WORK")])
+    lines = raw.split("\r\n")
+    assert "item4.ADR:;;Flat 2\\; Rose Court\\nCastle Road\\, East;Köln;NRW;50667;Vereinigtes Königreich" in lines
+    assert "item4.X-ABLabel:Ferienhaus\\, alt" in lines                                 # first group number not in use
+    assert "ADR;TYPE=WORK:;;1 Work Way;;;;" in lines
+    back = parse_vcard(raw)["addresses"]
+    assert {k: back[0][k] for k in tricky} == tricky
+    assert back[1]["label"] == "work"
+
+
+def test_line_breaks_in_any_form_cannot_inject_vcard_properties():
+    evil = _addr(street="x\rEMAIL:evil@attacker.test", city="y TEL:666", country="z\r\nEND:VCARD")
+    c = parse_vcard(_replace_vcard_fields(EMMA, addresses=[evil]))
+    assert c["emails"] == [] and c["phones"] == [] and c["uid"] == EMMA_UID
+    assert c["addresses"][0]["street"] == "x\nEMAIL:evil@attacker.test"
+
+
+def test_new_contact_can_carry_addresses():
+    c = parse_vcard(build_vcard(uid="n1", name="Neil Jones", addresses=[_addr(street="10 Carmelite Road", city="Aylesford",
+                                                                               country="UK")]))
+    assert c["addresses"][0]["street"] == "10 Carmelite Road" and c["addresses"][0]["label"] == "home"
+    assert parse_vcard(build_vcard(uid="n2", name="X", addresses=[_addr()]))["addresses"] == []    # empty entry is dropped
+
+
+def test_address_roundtrip_against_icloud_read_update_read(env):
+    s, _, _ = env
+    fake = WritableICloud(cards=CARDS + [EMMA])
+    svc = ContactsService(s, transport=httpx.MockTransport(fake))
+    before = svc.get(EMMA_UID)["addresses"]
+    keep = [{k: v for k, v in a.items() if k != "address"} for a in before]
+    r = _finishes(lambda: svc.update(EMMA_UID, addresses=keep + [_addr(**CASTLE_ROAD)]))
+    assert r["updated"] is True
+    method, name, body, if_match, _ = fake.writes[0]
+    assert (method, name, if_match) == ("PUT", str(len(CARDS)), f'"{len(CARDS)}"')     # conditional on the etag it read
+    after = svc.get(EMMA_UID)["addresses"]
+    assert after[:2] == before and after[2]["street"] == "27 Castle Road" and after[2]["postal_code"] == ""
+    assert "NOTE:private note" in body and "item1.X-ABADR:gb" in body
+
+
+def test_address_update_refuses_to_overwrite_a_contact_changed_elsewhere(env):
+    s, _, _ = env
+    fake = WritableICloud(cards=CARDS + [EMMA])
+    svc = ContactsService(s, transport=httpx.MockTransport(fake))
+    svc.get(EMMA_UID)
+    fake.etags[len(CARDS)] = '"changed-on-phone"'
+    with pytest.raises(ContactsError, match="changed since it was read"):
+        _finishes(lambda: svc.update(EMMA_UID, addresses=[_addr(**CASTLE_ROAD)]))
+    assert fake.writes == []
+
+
+def test_address_tools_accept_structured_addresses(env):
+    s, *_ = env
+    async def schemas():
+        mcp, _ = create_server(s)
+        return {t.name: t.input_schema for t in await mcp.list_tools()}
+    tools = asyncio.run(schemas())
+    for name in ("contacts_create", "contacts_update"):
+        assert "addresses" in tools[name]["properties"], name
+    assert "postal_code" in json.dumps(tools["contacts_update"])
