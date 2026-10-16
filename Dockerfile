@@ -1,4 +1,5 @@
-FROM python:3.12-slim
+# Python 3.12.15, pinned by digest; update deliberately (docker buildx imagetools inspect python:3.12-slim)
+FROM python:3.12-slim@sha256:a6e34c598f2467ed0e9a8d349809fcd8b5c603269512df273a0bb1784edc11b1
 ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
 WORKDIR /app
 COPY pyproject.toml README.md constraints.txt ./

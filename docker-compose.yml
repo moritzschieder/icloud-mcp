@@ -6,24 +6,45 @@ services:
     env_file: .env
     restart: unless-stopped
     volumes:
-      - icloud_mcp_data:/data          # OAuth client registrations and hashed tokens
+      - icloud_mcp_data:/data          # OAuth client registrations, hashed tokens, outbox, access-certs.json
     ports:
-      - "127.0.0.1:8000:8000"          # loopback only, for local debugging; the public path is the tunnel below
-      # Private port the Mac helper polls (Reminders/Notes bridge). Never route it through the tunnel. Loopback by default; set
-      # BRIDGE_BIND in .env to this machine's LAN or VPN address to let your Mac reach it.
-      - "${BRIDGE_BIND:-127.0.0.1}:${BRIDGE_PORT:-8001}:${BRIDGE_PORT:-8001}"
+      # MCP_BIND in .env: the LAN address the gateway (CT103) talks to; loopback when unset. The egress script on the host
+      # lets only the gateway reach it. Browser paths go through the tunnel below, behind Cloudflare Access.
+      - "${MCP_BIND:-127.0.0.1}:8000:8000"
+    networks:
+      default:
+        ipv4_address: 172.30.104.2     # fixed: the host egress rules (deploy/ct104/icloud-mcp-egress.sh) key on it
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    pids_limit: 256
 
-  # Optional Cloudflare Tunnel: point your tunnel's public hostname (the host in MCP_PUBLIC_URL) at http://icloud-mcp:8000.
-  # Token is in .tunnel.env (TUNNEL_TOKEN) so the app container never sees it.
-  # Do NOT put Cloudflare Access on this hostname: Claude's servers cannot pass an email-OTP login.
+  # Cloudflare Tunnel for the browser paths (/authorize, /login, /outbox). The whole hostname sits behind Cloudflare Access;
+  # MCP traffic from the gateway does not use the tunnel. Token is in .tunnel.env (TUNNEL_TOKEN).
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    image: cloudflare/cloudflared:2026.9.1@sha256:b269e8abd07a5bf6f3f4be65d5050b2174eca89c56a0241a8ff32a16aec454e4   # pinned; update deliberately, see homelab-ops #701
     profiles: ["tunnel"]          # opt in: `docker compose --profile tunnel up -d` (or COMPOSE_PROFILES=tunnel)
     container_name: icloud-mcp-cloudflared
     command: tunnel --no-autoupdate run
     env_file: .tunnel.env
     depends_on: [icloud-mcp]
     restart: unless-stopped
+    networks:
+      default:
+        ipv4_address: 172.30.104.3
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 256m
+    pids_limit: 128
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.104.0/24
 
 volumes:
   icloud_mcp_data:

@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh Cloudflare Access team keys for icloud-mcp
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/icloud-mcp-access-certs.sh

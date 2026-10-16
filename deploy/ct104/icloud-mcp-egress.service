@@ -1,0 +1,14 @@
+[Unit]
+Description=Egress and inbound rules for the icloud-mcp containers (DOCKER-USER)
+After=docker.service
+Requires=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/icloud-mcp-egress.sh
+ExecStop=/usr/sbin/iptables -F DOCKER-USER
+
+[Install]
+WantedBy=multi-user.target docker.service

@@ -3,6 +3,9 @@
 *
 !.gitignore
 !constraints.txt
+!deploy/
+!deploy/ct104/
+!deploy/ct104/*
 !.github/
 !.github/FUNDING.yml
 !.github/dependabot.yml
