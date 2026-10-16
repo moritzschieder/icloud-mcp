@@ -89,3 +89,12 @@ async def test_no_setup_page_even_with_sso(sso_app):
         r = await c.get("/setup", headers={"Cf-Access-Jwt-Assertion": token()})
         p = await c.post("/setup", data={"password": "abcd-efgh-ijkl-mnop"}, headers={"Cf-Access-Jwt-Assertion": token()})
     assert r.status_code == 404 and p.status_code in (404, 405)
+
+
+async def test_pages_tell_cloudflare_not_to_rewrite_them(sso_app):
+    # Cloudflare's email obfuscation would turn recipients into "[email protected]"; no-transform switches it off per response.
+    async with client_for(sso_app) as c:
+        pid = await _pending(c)
+        login = await c.get(f"/login?p={pid}", headers={"Cf-Access-Jwt-Assertion": token()})
+        outbox = await c.get("/outbox", headers={"Cf-Access-Jwt-Assertion": token()})
+    assert "no-transform" in login.headers["cache-control"] and "no-transform" in outbox.headers["cache-control"]

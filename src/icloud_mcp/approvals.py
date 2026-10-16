@@ -30,7 +30,7 @@ _TOKEN_TTL = 600        # seconds an Approve/Discard button stays valid after th
 _BODY_PREVIEW = 20000
 
 _HEADERS = {
-    "Cache-Control": "no-store",
+    "Cache-Control": "no-store, no-transform",   # no-transform: Cloudflare must not obfuscate the recipients shown here
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",

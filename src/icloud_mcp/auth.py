@@ -405,7 +405,7 @@ connection yourself a moment ago; anyone can ask for this page, and the password
 </form></main></body></html>"""
 
 _HEADERS = {
-    "Cache-Control": "no-store",
+    "Cache-Control": "no-store, no-transform",   # no-transform: no Cloudflare rewriting (email obfuscation) of this page
     "Referrer-Policy": "no-referrer",
     "X-Frame-Options": "DENY",
     "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
