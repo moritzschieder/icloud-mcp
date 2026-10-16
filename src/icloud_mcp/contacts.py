@@ -279,7 +279,8 @@ def _card_warnings(c: dict[str, Any]) -> list[str]:
                         str(c.get("job_title") or ""), " ".join(labels))
 
 
-_CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f]")          # every control character except the newline, which is escaped below
+# every control character except the newline (escaped below), plus the Unicode line breaks str.splitlines() also splits on
+_CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f\x85\u2028\u2029]")
 _EMAIL_OK = re.compile(r"^[^\s@<>,;\"]+@[^\s@<>,;\"]+\.[^\s@<>,;\"]+$")
 _BDAY_OK = re.compile(r"^(?:\d{4}-|--)\d{2}-\d{2}$")
 
@@ -408,6 +409,33 @@ def _append_vcard_items(raw: str, emails: list[str] | None = None, phones: list[
     return "\r\n".join(unfolded[:at] + lines + unfolded[at:] + [""]), added
 
 
+def _address_blocks(lines: list[str]) -> list[tuple[dict[str, Any], list[str]]]:
+    """Each stored ADR as (parsed address, its original lines). A grouped ADR brings along every line of its group
+    (item2.X-ABADR country code, item2.X-ABLabel), so it can be written back exactly as it was."""
+    groups: dict[str, list[str]] = {}
+    for line in lines:
+        m = _LINE.match(line)
+        if m and "." in m["key"]:
+            groups.setdefault(m["key"].rpartition(".")[0].lower(), []).append(line)
+    blocks = []
+    for line in lines:
+        m = _LINE.match(line)
+        if not m or m["key"].rpartition(".")[2].upper() != "ADR":
+            continue
+        group = m["key"].rpartition(".")[0].lower()
+        own = groups[group] if group else [line]
+        parsed = parse_vcard("\r\n".join(["BEGIN:VCARD", "UID:x", *own, "END:VCARD"]))
+        if parsed and parsed["addresses"]:
+            blocks.append((parsed["addresses"][0], own))
+    return blocks
+
+
+def _same_address(stored: dict[str, Any], wanted: dict[str, Any]) -> bool:
+    parts = lambda a: [str(a.get(k) or "").strip() for k in ADR_PARTS]  # noqa: E731
+    return (parts(stored) == parts(wanted)
+            and (stored.get("label") or "home").lower() == (str(wanted.get("label") or "").strip() or "home").lower())
+
+
 def _replace_vcard_fields(raw: str, **updates: Any) -> str:
     """Replace selected fields while retaining untouched iCloud vCard properties (photos, notes, labels, etc.)."""
     replace = {"name": ("FN",), "given_name": ("N",), "family_name": ("N",), "nickname": ("NICKNAME",),
@@ -440,10 +468,21 @@ def _replace_vcard_fields(raw: str, **updates: Any) -> str:
         if field in wanted:
             generated.extend(_v_line(key, item.strip()) for item in updates[field] if item.strip())
 
-    if "addresses" in wanted:
-        generated.extend(_adr_lines(updates["addresses"], _free_item_number(raw)))
-
     lines = re.sub(r"\r?\n[ \t]", "", raw).splitlines()
+    if "addresses" in wanted:
+        # An address passed back unchanged (as contacts_get_contact returned it) keeps its original lines, including Apple's
+        # X-ABADR country code and pref flag; only new or edited ones are generated.
+        unused = _address_blocks(lines)
+        fresh: list[dict[str, Any]] = []
+        for a in updates["addresses"]:
+            match = next((b for b in unused if _same_address(b[0], a)), None)
+            if match:
+                unused.remove(match)
+                generated.extend(match[1])
+            else:
+                fresh.append(a)
+        generated.extend(_adr_lines(fresh, _free_item_number(raw)))
+
     # A replaced property that sits in an Apple group (item3.EMAIL) takes the group's label lines with it (item3.X-ABLabel,
     # item3.X-ABADR), so no orphaned labels are left behind.
     dropped_groups = set()
