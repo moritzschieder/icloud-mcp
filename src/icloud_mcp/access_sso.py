@@ -1,4 +1,4 @@
-"""Optional owner sign-in through Cloudflare Access for /outbox, the /login consent page and /setup.
+"""Optional owner sign-in through Cloudflare Access for /outbox and the /login consent page.
 
 When the server sits behind a Cloudflare Access application that already authenticates the owner (for example with an
 OIDC identity provider and a passkey), asking for the owner password again on /outbox is a second login for the same

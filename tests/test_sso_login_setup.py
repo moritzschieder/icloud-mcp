@@ -1,11 +1,11 @@
-"""Owner sign-in through Cloudflare Access on the /login consent page and the /setup page (access_sso.py)."""
+"""Owner sign-in through Cloudflare Access on the /login consent page (access_sso.py)."""
 from __future__ import annotations
 
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
 
-from icloud_mcp import access_sso, setup_page
+from icloud_mcp import access_sso
 from icloud_mcp.config import Settings
 from icloud_mcp.server import create_server
 
@@ -83,44 +83,9 @@ async def test_password_still_works_with_sso_on(sso_app):
     assert r.status_code == 302 and "code=" in r.headers["location"]
 
 
-async def test_setup_absent_without_sso(tmp_path, monkeypatch):
-    app = _server(tmp_path, monkeypatch, sso=False)
-    async with client_for(app) as c:
+async def test_no_setup_page_even_with_sso(sso_app):
+    # The app password stays in .env (1Password); no web page may change it.
+    async with client_for(sso_app) as c:
         r = await c.get("/setup", headers={"Cf-Access-Jwt-Assertion": token()})
-    assert r.status_code == 404
-
-
-async def test_setup_refuses_without_access_identity(sso_app):
-    async with client_for(sso_app) as c:
-        r = await c.get("/setup")
-        p = await c.post("/setup", data={"password": "abcd-efgh-ijkl-mnop", "exp": "9999999999", "tok": "x"})
-    assert r.status_code == 403 and p.status_code == 403
-
-
-async def test_setup_saves_and_restarts(sso_app, monkeypatch):
-    seen, timers = [], []
-    async def fake_store(_s, raw, via):
-        seen.append((raw, via))
-        return None
-    monkeypatch.setattr(setup_page, "check_and_store_app_password", fake_store)
-    monkeypatch.setattr(setup_page.threading, "Timer", lambda delay, fn: type("T", (), {"start": lambda self: timers.append(delay)})())
-    hdr = {"Cf-Access-Jwt-Assertion": token()}
-    async with client_for(sso_app) as c:
-        page = await c.get("/setup", headers=hdr)
-        assert page.status_code == 200 and "me@icloud.com" in page.text
-        exp = page.text.split('name="exp" value="', 1)[1].split('"', 1)[0]
-        tok = page.text.split('name="tok" value="', 1)[1].split('"', 1)[0]
-        r = await c.post("/setup", data={"password": "abcd-efgh-ijkl-mnop", "exp": exp, "tok": tok}, headers=hdr)
-    assert r.status_code == 200 and "Saved" in r.text and "abcd" not in r.text
-    assert seen == [("abcd-efgh-ijkl-mnop", "the /setup page")] and timers == [1.0]
-
-
-async def test_setup_rejects_a_forged_form(sso_app, monkeypatch):
-    called = []
-    async def fake_store(*_a):
-        called.append(1)
-    monkeypatch.setattr(setup_page, "check_and_store_app_password", fake_store)
-    async with client_for(sso_app) as c:
-        r = await c.post("/setup", data={"password": "abcd-efgh-ijkl-mnop", "exp": "9999999999", "tok": "0" * 64},
-                         headers={"Cf-Access-Jwt-Assertion": token()})
-    assert r.status_code == 403 and called == []
+        p = await c.post("/setup", data={"password": "abcd-efgh-ijkl-mnop"}, headers={"Cf-Access-Jwt-Assertion": token()})
+    assert r.status_code == 404 and p.status_code in (404, 405)
