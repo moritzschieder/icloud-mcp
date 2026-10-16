@@ -3,6 +3,7 @@
 *
 !.gitignore
 !constraints.txt
+!requirements.lock
 !deploy/
 !deploy/ct104/
 !deploy/ct104/*
