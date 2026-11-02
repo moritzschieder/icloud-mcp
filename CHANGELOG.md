@@ -5,6 +5,14 @@ Update the Mac helper before the server whenever its version changes.
 
 ## Unreleased
 
+- **Contacts: finer permissions, notes and Apple's further fields.** `CONTACTS_ALLOW_EMAIL_ADDS` lets agents add addresses and
+  numbers while `CONTACTS_ALLOW_EMAIL_CHANGES=false` still blocks replacing and clearing them. `CONTACTS_ALLOW_NOTES` exposes
+  notes for reading and writing, `CONTACTS_ALLOW_PHOTOS` does the same for photos through `contacts_get_contact_photo` and `photo`
+  on `contacts_update_contact` (both off by default). `CONTACTS_ALLOW_DELETE=false` removes `contacts_delete_contact`. Read and
+  write middle name, prefix, suffix, department, maiden name, phonetic names, "show as company", related names, further dates,
+  social profiles and instant messages. Changing a name no longer drops the middle name, prefix or suffix, and changing the
+  company no longer drops the department. `organization` is now the company alone; a department comes back as `department`.
+
 - **Optional owner sign-in through Cloudflare Access on `/outbox`.** Behind an Access application that already signs the
   owner in (for example a passkey through an OIDC provider), the outbox no longer asks for the owner password a second
   time. Set `OWNER_ACCESS_TEAM_DOMAIN`, `OWNER_ACCESS_AUD` and `OWNER_ACCESS_EMAILS`; the page then verifies the signed

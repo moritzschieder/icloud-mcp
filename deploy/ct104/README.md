@@ -21,4 +21,5 @@ Check: from inside the app container `example.com:443` must fail and `imap.mail.
 `.env` additions for this setup: `MCP_BIND=192.168.1.191`, `MCP_EXTRA_ALLOWED_HOSTS=192.168.1.191:8000`,
 `OWNER_ACCESS_TEAM_DOMAIN=schieder.cloudflareaccess.com`, `OWNER_ACCESS_AUD=<AUD of the Access app>`,
 `OWNER_ACCESS_EMAILS=moritz@schieder.org`, `OWNER_ACCESS_CERTS_FILE=/data/access-certs.json`,
-`CONTACTS_ALLOW_EMAIL_CHANGES=false`, `LOG_LEVEL=WARNING`.
+`CONTACTS_ALLOW_EMAIL_CHANGES=false`, `CONTACTS_ALLOW_EMAIL_ADDS=true`, `CONTACTS_ALLOW_NOTES=true`, `CONTACTS_ALLOW_PHOTOS=true`,
+`CONTACTS_ALLOW_DELETE=false`, `LOG_LEVEL=WARNING`.

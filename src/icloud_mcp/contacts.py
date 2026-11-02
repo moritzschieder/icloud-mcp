@@ -4,10 +4,12 @@ iCloud's CardDAV serves vCard 3.0. Observed quirks this module is built around: 
 host than the discovery URL (follow the returned hrefs), a single addressbook-query returns every card in one response, and
 Apple groups properties as ``item3.EMAIL`` with the label in ``item3.X-ABLabel`` (about half of real emails use that form).
 Contacts are fetched whole and searched locally, because server-side filtering is unreliable on iCloud (see the calendar UID
-query, which it rejects). Notes and photos are never returned to agents.
+query, which it rejects). Notes and photos reach agents only when the owner sets CONTACTS_ALLOW_NOTES, CONTACTS_ALLOW_PHOTOS.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import contextlib
 import logging
 import re
@@ -52,14 +54,23 @@ class ContactsError(Exception):
 # ---------------------------------------------------------------------------
 # vCard parsing (3.0)
 # ---------------------------------------------------------------------------
-_SKIP = {"PHOTO", "LOGO", "SOUND", "KEY", "NOTE", "X-IMAGEHASH", "X-IMAGETYPE", "X-SHARED-PHOTO-DISPLAY-PREF",
-         "X-ADDRESSING-GRAMMAR", "VND-63-SENSITIVE-CONTENT-CONFIG"}          # binary, bulky or free-text we never expose
+_SKIP = {"PHOTO", "LOGO", "SOUND", "KEY", "X-IMAGEHASH", "X-IMAGETYPE", "X-SHARED-PHOTO-DISPLAY-PREF",
+         "X-ADDRESSING-GRAMMAR", "VND-63-SENSITIVE-CONTENT-CONFIG"}          # binary or bulky, never exposed
 _LINE = re.compile(r'^(?P<key>[^:;]+)(?P<params>(?:;(?:"[^"]*"|[^:;"])*)*):(?P<value>.*)$')
 _ESC = re.compile(r"\\([\\,;nN])")
 # vCard ADR component order (RFC 6350 6.3.1); the names are what the tools accept and return
 ADR_PARTS = ("po_box", "extended", "street", "city", "region", "postal_code", "country")
 _ADR_TYPES = {"home", "work", "other"}
 _TYPE_LABELS = ("home", "work", "school", "other", "mobile", "cell", "iphone", "main", "fax", "pager", "car", "assistant", "callback")
+# Apple's single-value extras: vCard property -> field name in tool results and arguments
+_EXTRA_TEXT = {"X-PHONETIC-FIRST-NAME": "phonetic_given_name", "X-PHONETIC-MIDDLE-NAME": "phonetic_middle_name",
+               "X-PHONETIC-LAST-NAME": "phonetic_family_name", "X-PHONETIC-ORG": "phonetic_organization",
+               "X-MAIDENNAME": "maiden_name"}
+# Apple's built-in labels are stored wrapped as _$!<Spouse>!$_, so the Contacts app shows them in the device's language
+_APPLE_LABELS = {x.lower(): x for x in ("Anniversary", "Other", "Spouse", "Child", "Mother", "Father", "Parent", "Brother", "Sister",
+                                        "Friend", "Partner", "Assistant", "Manager")}
+_PARAM_SAFE = re.compile(r"[\w .@+\-]{1,80}")                # service and user names go into vCard parameters: nothing that can end one
+_IM_SCHEMES = {"skype": "skype", "jabber": "xmpp", "xmpp": "xmpp"}
 
 
 def _unescape(v: str) -> str:
@@ -105,6 +116,14 @@ def _label(types: list[str], custom: str | None) -> str:
     return ""
 
 
+def _param(params: str, wanted: str) -> str:
+    for p in _split(params.lstrip(";"), ";") if params else []:
+        name, _, val = p.partition("=")
+        if name.strip().lower() == wanted:
+            return val.strip().strip('"')
+    return ""
+
+
 def _clean_custom_label(v: str) -> str:
     m = re.match(r"^_\$!<(.*)>!\$_$", v.strip())                 # Apple wraps built-in labels as _$!<Work>!$_
     return m.group(1).strip().lower() if m else v.strip()
@@ -114,6 +133,7 @@ def parse_vcard(text: str) -> dict[str, Any] | None:
     lines = re.sub(r"\r?\n[ \t]", "", text).splitlines()        # unfold
     props: list[tuple[str | None, str, str, str]] = []           # (group, NAME, params, value)
     labels: dict[str, str] = {}
+    has_photo = False
     for line in lines:
         m = _LINE.match(line)
         if not m:
@@ -124,6 +144,8 @@ def parse_vcard(text: str) -> dict[str, Any] | None:
         if name == "X-ABLABEL" and group:
             labels[group.lower()] = _clean_custom_label(_unescape(value))
             continue
+        if name == "PHOTO":
+            has_photo = True
         if name in _SKIP:
             continue
         props.append((group.lower() or None, name, params, value))
@@ -140,10 +162,16 @@ def parse_vcard(text: str) -> dict[str, Any] | None:
         elif name == "N":
             parts = [_unescape(p).strip() for p in _split(value, ";")] + [""] * 5
             c["family_name"], c["given_name"] = parts[0], parts[1]
+            for key, part in zip(("middle_name", "prefix", "suffix"), parts[2:5]):
+                if part:
+                    c[key] = part
         elif name == "NICKNAME":
             c["nickname"] = _unescape(value).strip()
         elif name == "ORG":
-            c["organization"] = ", ".join(p for p in (_unescape(x).strip() for x in _split(value, ";")) if p)
+            parts = [_unescape(x).strip() for x in _split(value, ";")]
+            c["organization"] = parts[0]
+            if department := ", ".join(p for p in parts[1:] if p):
+                c["department"] = department
         elif name == "TITLE":
             c["job_title"] = _unescape(value).strip()
         elif name == "EMAIL":
@@ -167,6 +195,29 @@ def parse_vcard(text: str) -> dict[str, Any] | None:
             u = _unescape(value).strip()
             if u:
                 c["urls"].append(u)
+        elif name == "NOTE":
+            c["_note"] = _unescape(value).strip()                # underscore: left out of results unless the owner allows notes
+        elif name in _EXTRA_TEXT:
+            if text := _unescape(value).strip():
+                c[_EXTRA_TEXT[name]] = text
+        elif name == "X-ABSHOWAS":
+            if value.strip().upper() == "COMPANY":
+                c["show_as_company"] = True
+        elif name == "X-ABRELATEDNAMES":
+            if text := _unescape(value).strip():
+                c.setdefault("related_names", []).append({"name": text, "label": custom or ""})
+        elif name == "X-ABDATE":
+            if when := value.strip():
+                when = "--" + when[5:] if when.startswith("1604-") else when       # Apple's "year unknown"
+                c.setdefault("dates", []).append({"date": when, "label": custom or ""})
+        elif name == "X-SOCIALPROFILE":
+            service = next((t for t in _types(params) if t not in ("pref", "home", "work", "other")), custom or "")
+            c.setdefault("social_profiles", []).append({"service": service, "username": _param(params, "x-user"),
+                                                        "url": _unescape(value).strip()})
+        elif name == "IMPP":
+            target = _unescape(value).strip()
+            c.setdefault("instant_messages", []).append({"service": _param(params, "x-service-type"),
+                                                         "username": target.partition(":")[2] or target})
         elif name == "X-ADDRESSBOOKSERVER-KIND" and value.strip().lower() == "group":
             c["kind"] = "group"
         elif name == "X-ADDRESSBOOKSERVER-MEMBER":
@@ -174,6 +225,8 @@ def parse_vcard(text: str) -> dict[str, Any] | None:
             c.setdefault("members", []).append(member[9:] if member.lower().startswith("urn:uuid:") else member)
     if not c["uid"]:
         return None
+    if has_photo:
+        c["_has_photo"] = True                                    # underscore: left out of results unless the owner allows photos
     c["name"] = (fn or " ".join(p for p in (c["given_name"], c["family_name"]) if p) or c["organization"]
                  or (c["emails"][0]["address"] if c["emails"] else "") or "(no name)")
     c["has_email"] = bool(c["emails"])
@@ -199,7 +252,7 @@ def _indexed(c: dict[str, Any]) -> dict[str, Any]:
             "name": name,
             "words": name.split() + _norm(c["nickname"]).split(),
             "fields_name": " ".join([name, _norm(c["given_name"]), _norm(c["family_name"]), _norm(c["nickname"])]),
-            "org": _norm(c["organization"]),
+            "org": _norm(" ".join((c["organization"], c.get("department", "")))),
             "emails": [_norm(e["address"]) for e in c["emails"]],
             "phones": [_digits(p["number"]) for p in c["phones"]],
             "all_words": _name_words(c),
@@ -280,6 +333,12 @@ def _card_warnings(c: dict[str, Any]) -> list[str]:
 
 
 # every control character except the newline (escaped below), plus the Unicode line breaks str.splitlines() also splits on
+def _detail_warnings(d: dict[str, Any]) -> list[str]:
+    """The fields only a full read returns. A note is free text, and a card can come from a stranger's signature."""
+    entries = [str(v) for field in _EXTRA_LISTS for e in d.get(field) or [] for v in e.values()]
+    return warnings_for(str(d.get("note") or ""), str(d.get("department") or ""), str(d.get("maiden_name") or ""), " ".join(entries))
+
+
 _CONTROL = re.compile(r"[\x00-\x09\x0b-\x1f\x7f\x85\u2028\u2029]")
 _EMAIL_OK = re.compile(r"^[^\s@<>,;\"]+@[^\s@<>,;\"]+\.[^\s@<>,;\"]+$")
 _BDAY_OK = re.compile(r"^(?:\d{4}-|--)\d{2}-\d{2}$")
@@ -409,8 +468,8 @@ def _append_vcard_items(raw: str, emails: list[str] | None = None, phones: list[
     return "\r\n".join(unfolded[:at] + lines + unfolded[at:] + [""]), added
 
 
-def _address_blocks(lines: list[str]) -> list[tuple[dict[str, Any], list[str]]]:
-    """Each stored ADR as (parsed address, its original lines). A grouped ADR brings along every line of its group
+def _address_blocks(lines: list[str], prop: str = "ADR", field: str = "addresses") -> list[tuple[dict[str, Any], list[str]]]:
+    """Each stored property as (parsed entry, its original lines). A grouped one brings along every line of its group
     (item2.X-ABADR country code, item2.X-ABLabel), so it can be written back exactly as it was."""
     groups: dict[str, list[str]] = {}
     for line in lines:
@@ -420,13 +479,13 @@ def _address_blocks(lines: list[str]) -> list[tuple[dict[str, Any], list[str]]]:
     blocks = []
     for line in lines:
         m = _LINE.match(line)
-        if not m or m["key"].rpartition(".")[2].upper() != "ADR":
+        if not m or m["key"].rpartition(".")[2].upper() != prop:
             continue
         group = m["key"].rpartition(".")[0].lower()
         own = groups[group] if group else [line]
         parsed = parse_vcard("\r\n".join(["BEGIN:VCARD", "UID:x", *own, "END:VCARD"]))
-        if parsed and parsed["addresses"]:
-            blocks.append((parsed["addresses"][0], own))
+        if parsed and parsed.get(field):
+            blocks.append((parsed[field][0], own))
     return blocks
 
 
@@ -436,11 +495,85 @@ def _same_address(stored: dict[str, Any], wanted: dict[str, Any]) -> bool:
             and (stored.get("label") or "home").lower() == (str(wanted.get("label") or "").strip() or "home").lower())
 
 
+def _clean_entry(entry: dict[str, Any], keys: tuple[str, ...]) -> dict[str, str]:
+    return {k: str(entry.get(k) or "").strip() for k in keys}
+
+
+def _labelled_lines(prop: str, value: str, label: str, item: int) -> list[str]:
+    """One property, grouped with its label the way Apple stores it. A built-in label goes in wrapped, any other as written."""
+    if not label:
+        return [_v_line(prop, value)]
+    wrapped = f"_$!<{_APPLE_LABELS[label.lower()]}>!$_" if label.lower() in _APPLE_LABELS else label
+    return [_v_line(f"item{item}.{prop}", value), _v_line(f"item{item}.X-ABLabel", wrapped)]
+
+
+def _related_lines(e: dict[str, str], item: int) -> list[str]:
+    if not e["name"]:
+        raise ContactsError("A related name needs a name.")
+    return _labelled_lines("X-ABRELATEDNAMES", e["name"], e["label"], item)
+
+
+def _date_lines(e: dict[str, str], item: int) -> list[str]:
+    if not _BDAY_OK.fullmatch(e["date"]):
+        raise ContactsError("A date must be YYYY-MM-DD (or --MM-DD when the year is unknown).")
+    if e["date"].startswith("--"):
+        return _labelled_lines("X-ABDATE;X-APPLE-OMIT-YEAR=1604", "1604-" + e["date"][2:], e["label"], item)
+    return _labelled_lines("X-ABDATE", e["date"], e["label"], item)
+
+
+def _social_lines(e: dict[str, str], item: int) -> list[str]:
+    if not _PARAM_SAFE.fullmatch(e["service"]) or (e["username"] and not _PARAM_SAFE.fullmatch(e["username"])):
+        raise ContactsError("A social profile needs a service, and service and username may only hold letters, digits, spaces and . @ + - _.")
+    if not (e["url"] or e["username"]):
+        raise ContactsError("A social profile needs a url or a username.")
+    user = f";x-user={e['username']}" if e["username"] else ""
+    return [_v_line(f"X-SOCIALPROFILE;type={e['service']}{user}", e["url"] or f"x-apple:{e['username']}")]
+
+
+def _im_lines(e: dict[str, str], item: int) -> list[str]:
+    if not _PARAM_SAFE.fullmatch(e["service"]) or not e["username"]:
+        raise ContactsError("An instant-message entry needs a username and a service of letters, digits, spaces and . @ + - _.")
+    scheme = _IM_SCHEMES.get(e["service"].lower(), "x-apple")
+    return [_v_line(f"IMPP;X-SERVICE-TYPE={e['service']}", f"{scheme}:{e['username']}")]
+
+
+# field -> (vCard property, entry keys, line builder); replaced as a whole, entries passed back unchanged keep their original lines
+_EXTRA_LISTS = {"related_names": ("X-ABRELATEDNAMES", ("name", "label"), _related_lines),
+                "dates": ("X-ABDATE", ("date", "label"), _date_lines),
+                "social_profiles": ("X-SOCIALPROFILE", ("service", "username", "url"), _social_lines),
+                "instant_messages": ("IMPP", ("service", "username"), _im_lines)}
+
+
+def _decode_photo(value: str) -> tuple[bytes, str]:
+    """(image bytes, vCard type) from base64 or a base64 data URL. Only JPEG and PNG, the formats Contacts stores, are accepted."""
+    text = re.sub(r"\s", "", value.partition("base64,")[2] or value)
+    try:
+        data = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ContactsError("photo must be base64 (a plain string or a data: URL).") from e
+    kind = _image_type(data)
+    if kind is None:
+        raise ContactsError("photo must be a JPEG or PNG image.")
+    return data, kind
+
+
+def _image_type(data: bytes) -> str | None:
+    return "JPEG" if data.startswith(b"\xff\xd8\xff") else "PNG" if data.startswith(b"\x89PNG\r\n\x1a\n") else None
+
+
+def _same_entry(stored: dict[str, Any], wanted: dict[str, str]) -> bool:
+    return all(str(stored.get(k) or "").strip().casefold() == v.casefold() for k, v in wanted.items())
+
+
 def _replace_vcard_fields(raw: str, **updates: Any) -> str:
     """Replace selected fields while retaining untouched iCloud vCard properties (photos, notes, labels, etc.)."""
     replace = {"name": ("FN",), "given_name": ("N",), "family_name": ("N",), "nickname": ("NICKNAME",),
                "organization": ("ORG",), "job_title": ("TITLE",), "emails": ("EMAIL",), "phones": ("TEL",),
-               "birthday": ("BDAY",), "urls": ("URL",), "addresses": ("ADR",)}
+               "birthday": ("BDAY",), "urls": ("URL",), "addresses": ("ADR",), "middle_name": ("N",), "prefix": ("N",),
+               "suffix": ("N",), "department": ("ORG",), "note": ("NOTE",), "show_as_company": ("X-ABSHOWAS",),
+               "photo": ("PHOTO", "X-IMAGETYPE", "X-IMAGEHASH"),      # the last two describe the old picture
+               **{field: (prop,) for prop, field in _EXTRA_TEXT.items()},
+               **{field: (spec[0],) for field, spec in _EXTRA_LISTS.items()}}
     wanted = {k for k, v in updates.items() if v is not None}
     if not wanted:
         raise ContactsError("Provide at least one field to change.")
@@ -450,16 +583,23 @@ def _replace_vcard_fields(raw: str, **updates: Any) -> str:
     old = parse_vcard(raw)
     if not old:
         raise ContactsError("The stored contact is not a valid vCard.")
-    # Names share a structured N field. Keep either existing part if only the other changes.
-    given = updates.get("given_name") if updates.get("given_name") is not None else old["given_name"]
-    family = updates.get("family_name") if updates.get("family_name") is not None else old["family_name"]
+    # Structured fields: keep every existing part that is not being changed.
+    part = lambda field: updates[field] if updates.get(field) is not None else old.get(field, "")  # noqa: E731
     display = updates.get("name") if updates.get("name") is not None else old["name"]
     generated: list[str] = []
     if "name" in wanted:
         generated.append(_v_line("FN", display))
-    if "given_name" in wanted or "family_name" in wanted:
-        generated.append(_v_structured("N", [family, given, "", "", ""]))
-    single = {"nickname": "NICKNAME", "organization": "ORG", "job_title": "TITLE", "birthday": "BDAY"}
+    if wanted & {"given_name", "family_name", "middle_name", "prefix", "suffix"}:
+        generated.append(_v_structured("N", [part("family_name"), part("given_name"), part("middle_name"), part("prefix"), part("suffix")]))
+    if wanted & {"organization", "department"} and (part("organization") or part("department")):
+        generated.append(_v_structured("ORG", [part("organization"), part("department")] if part("department") else [part("organization")]))
+    if updates.get("photo"):
+        data, kind = _decode_photo(updates["photo"])
+        generated.append(f"PHOTO;ENCODING=b;TYPE={kind}:{base64.b64encode(data).decode()}")      # re-encoded: nothing but base64 goes in
+    if updates.get("show_as_company"):
+        generated.append("X-ABShowAs:COMPANY")
+    single = {"nickname": "NICKNAME", "job_title": "TITLE", "birthday": "BDAY", "note": "NOTE",
+              **{field: prop for prop, field in _EXTRA_TEXT.items()}}
     for field, key in single.items():
         if field in wanted and updates[field]:
             generated.append(_v_line(key, updates[field]))
@@ -482,6 +622,19 @@ def _replace_vcard_fields(raw: str, **updates: Any) -> str:
             else:
                 fresh.append(a)
         generated.extend(_adr_lines(fresh, _free_item_number(raw)))
+
+    for field, (prop, entry_keys, build) in _EXTRA_LISTS.items():
+        if field not in wanted:
+            continue
+        unused = _address_blocks(lines, prop, field)
+        for entry in updates[field]:
+            e = _clean_entry(entry, entry_keys)
+            match = next((b for b in unused if _same_entry(b[0], e)), None)
+            if match:
+                unused.remove(match)
+                generated.extend(match[1])
+            else:
+                generated.extend(build(e, _free_item_number("\r\n".join([raw, *generated]))))
 
     # A replaced property that sits in an Apple group (item3.EMAIL) takes the group's label lines with it (item3.X-ABLabel,
     # item3.X-ABADR), so no orphaned labels are left behind.
@@ -810,12 +963,44 @@ class ContactsService:
         for c in self._people():
             if c["uid"] == uid:
                 d = {k: v for k, v in c.items() if not k.startswith("_")}
+                if self.s.contacts_allow_notes and c.get("_note"):
+                    d["note"] = c["_note"]
+                if self.s.contacts_allow_photos and c.get("_has_photo"):
+                    d["has_photo"] = True
                 if groups := self._membership().get(uid):
                     d["groups"] = groups
                 d.update(self._marks(c))
+                if w := _detail_warnings(d):
+                    d["safety_warnings"] = list(dict.fromkeys([*d.get("safety_warnings", []), *w]))
                 d["notice"] = UNTRUSTED_NOTICE
                 return d
         raise ContactsError(f"No contact with uid '{uid}'. Use contacts_search_contacts to find the uid.")
+
+    def get_photo(self, uid: str) -> dict[str, Any]:
+        if not self.s.contacts_allow_photos:
+            raise ContactsError("Blocked: contact photos are off on this server (CONTACTS_ALLOW_PHOTOS=false).")
+        with self._lock:
+            record = self._record(uid)
+            with self._client() as client:
+                raw = self._mutate(client, "GET", record["_href"]).text
+                line = next((m for m in map(_LINE.match, re.sub(r"\r?\n[ \t]", "", raw).splitlines())
+                             if m and m["key"].rpartition(".")[2].upper() == "PHOTO"), None)
+                if line is None:
+                    return {"uid": uid, "name": record["name"], "has_photo": False, "note": "This contact has no photo."}
+                value = line["value"].strip()
+                if value.lower().startswith("https://"):             # iCloud can store the picture apart from the card
+                    data = self._mutate(client, "GET", value).content
+                else:
+                    try:
+                        data = base64.b64decode(re.sub(r"\s", "", value.partition("base64,")[2] or value), validate=True)
+                    except (binascii.Error, ValueError) as e:
+                        raise ContactsError("The stored photo is not readable base64.") from e
+        if len(data) > self.s.max_attachment_bytes:
+            raise ContactsError(f"The photo exceeds MAX_ATTACHMENT_BYTES ({self.s.max_attachment_bytes}).")
+        kind = _image_type(data)
+        return {"uid": uid, "name": record["name"], "has_photo": True, "size_bytes": len(data),
+                "media_type": f"image/{kind.lower()}" if kind else "application/octet-stream",
+                "content_base64": base64.b64encode(data).decode()}
 
     def _marks(self, c: dict[str, Any]) -> dict[str, Any]:
         """Per-card provenance an agent should see: warnings in the card's text, and addresses an agent itself added."""
@@ -957,13 +1142,25 @@ class ContactsService:
         return {"created": True, "uid": uid, "name": parse_vcard(raw)["name"]}
 
     def update(self, uid: str, *, add_emails: list[str] | None = None, add_phones: list[str] | None = None,
-               **updates: Any) -> dict[str, Any]:
+               add_note: str | None = None, **updates: Any) -> dict[str, Any]:
         if (add_emails and updates.get("emails") is not None) or (add_phones and updates.get("phones") is not None):
             raise ContactsError("Use emails/phones (the complete list) or add_emails/add_phones, not both for the same field.")
-        touches = bool(add_emails or add_phones or updates.get("emails") is not None or updates.get("phones") is not None)
-        if touches and not self.s.contacts_allow_email_changes:
-            raise ContactsError("Blocked: changing a contact's email addresses or phone numbers is disabled on this server "
-                                "(CONTACTS_ALLOW_EMAIL_CHANGES=false). Tell the owner the address so they can add it themselves.")
+        if add_note and updates.get("note") is not None:
+            raise ContactsError("Use note (the whole text) or add_note, not both.")
+        if (add_note or updates.get("note") is not None) and not self.s.contacts_allow_notes:
+            raise ContactsError("Blocked: contact notes are off on this server (CONTACTS_ALLOW_NOTES=false).")
+        if updates.get("photo") is not None:
+            if not self.s.contacts_allow_photos:
+                raise ContactsError("Blocked: contact photos are off on this server (CONTACTS_ALLOW_PHOTOS=false).")
+            if updates["photo"] and len(_decode_photo(updates["photo"])[0]) > self.s.max_attachment_bytes:
+                raise ContactsError(f"The photo exceeds MAX_ATTACHMENT_BYTES ({self.s.max_attachment_bytes}).")
+        if (updates.get("emails") is not None or updates.get("phones") is not None) and not self.s.contacts_allow_email_changes:
+            raise ContactsError("Blocked: replacing or clearing a contact's email addresses or phone numbers is disabled on this server "
+                                "(CONTACTS_ALLOW_EMAIL_CHANGES=false). Tell the owner so they can change it themselves.")
+        if (add_emails or add_phones) and not (self.s.contacts_allow_email_changes or self.s.contacts_allow_email_adds):
+            raise ContactsError("Blocked: adding email addresses or phone numbers to a contact is disabled on this server "
+                                "(CONTACTS_ALLOW_EMAIL_CHANGES=false, CONTACTS_ALLOW_EMAIL_ADDS=false). Tell the owner the address so "
+                                "they can add it themselves.")
         with self._lock:
             record = self._record(uid)
             with self._client() as client:
@@ -977,6 +1174,10 @@ class ContactsService:
                 new_raw = raw
                 if add_emails or add_phones:
                     new_raw, added = _append_vcard_items(new_raw, add_emails, add_phones)
+                if add_note and add_note.strip():
+                    current = (parse_vcard(raw) or {}).get("_note", "")
+                    if not current.endswith(add_note.strip()):       # a retried call must not add the text twice
+                        updates["note"] = f"{current}\n{add_note.strip()}" if current else add_note.strip()
                 changed_addresses = list(added) + [str(x) for x in (updates.get("emails") or [])] + [str(x) for x in (updates.get("phones") or [])]
                 if any(v is not None for v in updates.values()):
                     new_raw = _replace_vcard_fields(new_raw, **updates)
@@ -994,6 +1195,8 @@ class ContactsService:
         return {"updated": True, "uid": uid, "name": parse_vcard(new_raw)["name"], **({"added": added} if added else {})}
 
     def delete(self, uid: str) -> dict[str, Any]:
+        if not self.s.contacts_allow_delete:
+            raise ContactsError("Blocked: deleting contacts is disabled on this server (CONTACTS_ALLOW_DELETE=false). The owner can delete it themselves.")
         with self._lock:
             record = self._record(uid)
             with self._client() as client:

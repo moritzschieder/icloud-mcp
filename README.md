@@ -272,6 +272,9 @@ A connector that can read your mail and act for you is a prompt-injection target
 | Agent emails invitations to strangers | Attendee changes are **blocked** | `ALLOW_CALENDAR_INVITES=false` |
 | Agent invites the wrong people once invites are on | Any address, at most 10 guests | `INVITE_ALLOWLIST`, `MAX_ATTENDEES` |
 | Agent puts a stranger's address on a real contact so a later reply goes there | Allowed, but the address is marked as agent-added in results and on the approval page | `CONTACTS_ALLOW_EMAIL_CHANGES=false` to block it |
+| Agent adds a stranger's address when you only blocked changes | Blocked too | `CONTACTS_ALLOW_EMAIL_ADDS=true` allows adding, never replacing or clearing |
+| Agent reads what your contact notes hold, or acts on text planted in one | Notes are not exposed | `CONTACTS_ALLOW_NOTES=true` to expose them; results carry the untrusted notice and safety warnings |
+| Agent deletes a contact | Allowed, permanent | `CONTACTS_ALLOW_DELETE=false` |
 | Agent reads years of archive for a task about today | Whole mailbox | `MAIL_MAX_AGE_DAYS` |
 | Hostile text is not spotted | Built-in patterns (English and Dutch) plus removal of text hidden in HTML mail (warned about when it reads like instructions; `show_hidden` shows it) | `SAFETY_SCREEN=command:<path>` adds your own classifier |
 | Agent mails arbitrary addresses | Any address, at most 25 per message | `SEND_ALLOWLIST`, `MAX_RECIPIENTS` |
@@ -357,7 +360,9 @@ Every name is `area_verb_noun` (`mail_send_message`, `calendar_create_event`). E
 - **Misspelled names are handled.** `contacts_search_contacts` suggests similar-sounding names when nothing matches exactly, and `mail_find_correspondent` finds people you've emailed by approximate name, address or company, reading only message headers. Approximate matches are labelled, and agents must ask you to confirm before sending, inviting or editing on one.
 - **Postal addresses** are read and written as street, city, region, postcode and country, with home, work or your own labels ("Holiday house"), stored the way Apple's Contacts app expects.
 - **Birthdays coming up.** `contacts_list_birthdays` lists them soonest first, with the age turned when the year is known (Apple's "year unknown" 1604 is understood, and 29 February falls on the 28th in other years).
-- Updates keep every field outside the changed ones and use ETags to refuse stale overwrites. `add_emails` and `add_phones` add to a card without touching its existing addresses or their labels. Contact photos and notes are never returned.
+- Updates keep every field outside the changed ones and use ETags to refuse stale overwrites. `add_emails` and `add_phones` add to a card without touching its existing addresses or their labels. Notes need `CONTACTS_ALLOW_NOTES=true`, which also lets agents write them (`note` replaces, `add_note` adds at the end). Photos need `CONTACTS_ALLOW_PHOTOS=true`: `contacts_get_contact_photo` fetches one, `photo` on `contacts_update_contact` replaces or removes it (JPEG or PNG).
+- **Apple's further fields.** `contacts_get_contact` and `contacts_update_contact` also cover middle name, prefix, suffix, department, maiden name, phonetic names, "show as company", related names, further dates, social profiles and instant messages. Entries passed back unchanged keep their original lines and labels.
+- **Three switches.** `CONTACTS_ALLOW_EMAIL_CHANGES=false` blocks replacing and clearing addresses and numbers; with `CONTACTS_ALLOW_EMAIL_ADDS=true` agents may still add one, marked as agent-added. `CONTACTS_ALLOW_DELETE=false` removes `contacts_delete_contact`.
 
 </details>
 
@@ -639,7 +644,7 @@ These only show up against Apple's real servers, never against local test server
 <details>
 <summary><b>Limits</b></summary>
 
-- Reminders, Notes, iCloud Drive, Maps, Messages and Health need the Mac helper and a Mac that is on; Health also needs your iPhone to export. Contact photos and notes are deliberately not exposed to agents, and deleting a contact is permanent.
+- Reminders, Notes, iCloud Drive, Maps, Messages and Health need the Mac helper and a Mac that is on; Health also needs your iPhone to export. Contact photos and notes reach agents only when you allow them, and deleting a contact is permanent.
 - One identity: aliases can't be used as the From address. Attachments that aren't text come back as base64 and are size-capped.
 - Mail calls reuse up to two logged-in connections, which saves the login (about a second) on each call after the first; calendar and contacts calls take about 1.5 to 5 seconds against iCloud.
 - Claude doesn't show custom icons for custom connectors yet ([open request](https://github.com/anthropics/claude-ai-mcp/issues/152)). The server serves and advertises the project logo anyway, so clients that do show icons, and your browser tab on the approval and outbox pages, display it.

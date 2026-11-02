@@ -168,6 +168,10 @@ class Settings:
     invite_allowlist: tuple[str, ...] = ()   # INVITE_ALLOWLIST: addresses/domains that may be invited when invites are on (empty = anyone)
     max_attendees: int = 10                 # MAX_ATTENDEES: most guests one event may carry through the connector
     contacts_allow_email_changes: bool = True  # CONTACTS_ALLOW_EMAIL_CHANGES: false = agents cannot add or replace emails/phones on cards
+    contacts_allow_email_adds: bool = False    # CONTACTS_ALLOW_EMAIL_ADDS: true = with the above false, agents may still add (never replace or clear)
+    contacts_allow_notes: bool = False         # CONTACTS_ALLOW_NOTES: true = contacts_get_contact returns a card's note and agents may write it
+    contacts_allow_photos: bool = False        # CONTACTS_ALLOW_PHOTOS: true = agents may fetch and replace a card's photo
+    contacts_allow_delete: bool = True         # CONTACTS_ALLOW_DELETE: false = contacts_delete_contact is not registered and deleting is refused
     mail_max_age_days: int = 0              # MAIL_MAX_AGE_DAYS: 0 = whole mailbox; N = searches never reach further back than N days
     safety_screen: str = ""                 # SAFETY_SCREEN: "" (built-in patterns) or "command:<path>" (the owner's own classifier)
     owner_addresses: tuple[str, ...] = ()   # OWNER_ADDRESSES: more addresses that are the owner's (aliases), e.g. on invitations
@@ -263,6 +267,10 @@ class Settings:
             invite_allowlist=tuple(x.lower() for x in _list("INVITE_ALLOWLIST")),
             max_attendees=max(1, _int("MAX_ATTENDEES", 10)),
             contacts_allow_email_changes=_bool("CONTACTS_ALLOW_EMAIL_CHANGES", True),
+            contacts_allow_email_adds=_bool("CONTACTS_ALLOW_EMAIL_ADDS", False),
+            contacts_allow_notes=_bool("CONTACTS_ALLOW_NOTES", False),
+            contacts_allow_photos=_bool("CONTACTS_ALLOW_PHOTOS", False),
+            contacts_allow_delete=_bool("CONTACTS_ALLOW_DELETE", True),
             mail_max_age_days=max(0, _int("MAIL_MAX_AGE_DAYS", 0)),
             owner_access_team=_str("OWNER_ACCESS_TEAM_DOMAIN").removeprefix("https://").rstrip("/").lower(),
             owner_access_aud=_str("OWNER_ACCESS_AUD"),

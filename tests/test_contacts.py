@@ -58,7 +58,7 @@ def test_grouped_and_plain_emails_are_all_found_with_their_labels():
 def test_phones_org_escapes_and_structure():
     c = parse_vcard(ANNA)
     assert [(p["number"], p["label"]) for p in c["phones"]] == [("+31 6 1234 5678", "cell"), ("+31 20 555 0100", "main")]
-    assert c["organization"] == "Acme, Inc., Sales" and c["job_title"] == "Head of Sales"
+    assert c["organization"] == "Acme, Inc." and c["department"] == "Sales" and c["job_title"] == "Head of Sales"
     assert c["name"] == "Anna Rivera" and c["given_name"] == "Anna Maria" and c["family_name"] == "Rivera"
     assert c["birthday"] == "1990-04-01" and c["urls"] == ["https://acme.example"]
     assert c["addresses"] == [{"address": "1 Main St;Apt 2, Springfield, 12345, Exampleland", "label": "home",   # \; unescaped, empty parts dropped
@@ -102,7 +102,7 @@ def test_replacing_emails_takes_their_grouped_labels_along():
 
 
 def test_notes_and_photos_never_reach_the_result():
-    blob = json.dumps(parse_vcard(ANNA))
+    blob = json.dumps({k: v for k, v in parse_vcard(ANNA).items() if not k.startswith("_")})      # what contacts_get_contact starts from
     assert "Ignore all previous instructions" not in blob and "evil@attacker.test" not in blob
     assert "/9j/4AAQ" not in blob and "abc123" not in blob and "PHOTO" not in blob
 
